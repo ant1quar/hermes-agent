@@ -649,18 +649,40 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         from gateway.run import _parse_session_key
         session_key = str(evt.get("session_key") or "").strip()
         derived = {}
+
+        def _source_from_store_entry(entry) -> Optional[SessionSource]:
+            if entry is None:
+                return None
+            try:
+                restored = self._restored_source(entry)
+                if restored is not None:
+                    return restored
+            except Exception as exc:
+                logger.debug("Synthetic process-event _restored_source failed: %s", exc)
+            return None
+
         if session_key:
             try:
-                self.session_store._ensure_loaded()
-                entry = self.session_store._entries.get(session_key)
-                if entry and getattr(entry, "origin", None):
-                    return self._restored_source(entry)
+                entry = self.session_store.lookup_by_session_key(session_key)
+                if src := _source_from_store_entry(entry):
+                    return src
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
                 return cached_source
             derived = _parse_session_key(session_key) or {}
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        if parent_session_id:
+            try:
+                entry = self.session_store.lookup_by_session_id(parent_session_id)
+                if src := _source_from_store_entry(entry):
+                    return src
+            except Exception as exc:
+                logger.debug(
+                    "Synthetic process-event lookup by parent_session_id %s failed: %s",
+                    parent_session_id, exc,
+                )
         profile = derived.get("profile")
         platform_name = str(evt.get("platform") or derived.get("platform") or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived.get("chat_type") or "").strip().lower()
@@ -706,6 +728,45 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             platform=platform, chat_id=chat_id, chat_type=chat_type, thread_id=_opt("thread_id"),
             user_id=_opt("user_id"), user_name=_opt("user_name"), scope_id=scope_id, profile=profile,
         )
+
+    def _align_process_event_source_with_route(self, source: SessionSource, evt: dict) -> SessionSource:
+        """Match synthetic wakes to the route's last committed native envelope (#141562 class).
+
+        Reconstructed SessionSource fields can disagree with the envelope snapshot_automation
+        borrows, yielding admission_conflict on every async-delegation inject."""
+        from gateway.session_authorities import active_authority
+        from gateway.session_automation import committed_route_envelope
+        from gateway.session_envelope import restore_native
+
+        authority = active_authority(self)
+        if authority is None or source is None:
+            return source
+        session_key = str(evt.get("session_key") or "").strip()
+        entry = None
+        if session_key.startswith("agent:"):
+            entry = self.session_store.lookup_by_session_key(session_key)
+        if entry is None:
+            parent = str(evt.get("parent_session_id") or "").strip()
+            if parent:
+                entry = self.session_store.lookup_by_session_id(parent)
+        if entry is None:
+            return source
+        envelope = committed_route_envelope(authority, entry)
+        if envelope is None:
+            return source
+        try:
+            restored = restore_native(
+                {"text": "", "native_text_v1": {k: v for k, v in envelope.items() if k != "media"}},
+                self,
+            )
+            aligned = restored.source
+            from gateway.session_identity import replace_source
+            if getattr(source, "message_id", None) is not None or getattr(aligned, "message_id", None):
+                aligned = replace_source(aligned, message_id=None)
+            return aligned
+        except Exception as exc:
+            logger.debug("Could not align process-event source with route envelope: %s", exc)
+            return source
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume queued watch events and inject them when notifications are enabled.
@@ -877,6 +938,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
         source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if source is not None:
+            source = self._align_process_event_source_with_route(source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
             raw_sid = _raw_process_event_session_id(evt)
