@@ -4430,6 +4430,63 @@ class BasePlatformAdapter(ABC):
                          "for %s (empty after extract, recovery yielded nothing).", self.name,
                          len(extracted.pre_extract), event.source.chat_id)
 
+    _BACKGROUND_TYPING_INTERVAL = 4.0
+    _BACKGROUND_TYPING_IDLE_TICKS = 2
+
+    def _owned_subagents_running(self, session_key: str) -> bool:
+        """True while a delegated child spawned by this session's agent is still registered."""
+        store = getattr(getattr(self, "gateway_runner", None), "session_store", None)
+        session_id = store.peek_session_id(session_key) if store is not None else None
+        if not session_id:
+            return False
+        from tools.delegate_tool_registry import list_active_subagents
+        return any(r.get("owner_agent_session_id") == session_id for r in list_active_subagents())
+
+    def _keep_typing_for_background_work(self, event: MessageEvent, session_key: str,
+                                         metadata: Optional[dict]) -> None:
+        """After a turn that left delegated children running, keep the chat's typing status alive
+        until they finish and their completion turns are delivered (those turns are admitted
+        through the session automation FIFO, which has no typing refresh of its own)."""
+        if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
+            return
+        try:
+            if not self._owned_subagents_running(session_key):
+                return
+        except Exception as exc:
+            logger.debug("[%s] background typing check failed: %s", self.name, exc)
+            return
+        tasks: dict[str, asyncio.Task] = self.__dict__.setdefault("_background_typing_tasks", {})
+        task = tasks.get(session_key)
+        if task is not None and not task.done():
+            return
+        tasks[session_key] = asyncio.create_task(
+            self._background_typing_loop(event.source.chat_id, session_key, metadata))
+
+    async def _background_typing_loop(self, chat_id: str, session_key: str, metadata: Optional[dict]) -> None:
+        """Refresh typing while the session has running children or a running turn; stop after
+        ``_BACKGROUND_TYPING_IDLE_TICKS`` consecutive idle checks (bridges the gap between a child
+        unregistering and its completion turn starting) without sending typing while idle."""
+        runner = getattr(self, "gateway_runner", None)
+        idle_ticks = 0
+        try:
+            while idle_ticks < self._BACKGROUND_TYPING_IDLE_TICKS:
+                children = self._owned_subagents_running(session_key)
+                turn = bool(runner is not None and runner._is_session_running(session_key))
+                if children or turn:
+                    idle_ticks = 0
+                    if chat_id not in self._typing_paused:
+                        with contextlib.suppress(Exception):
+                            await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata), timeout=1.5)
+                else:
+                    idle_ticks += 1
+                await asyncio.sleep(self._BACKGROUND_TYPING_INTERVAL)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("[%s] background typing loop failed: %s", self.name, exc)
+        finally:
+            self.__dict__.get("_background_typing_tasks", {}).pop(session_key, None)
+
     def _start_typing_refresh(self, event: MessageEvent, interrupt_event: asyncio.Event,
                               metadata: Optional[dict]) -> Optional[asyncio.Task]:
         """Spawn the typing-refresh task, or None when ``typing_indicator=False``.
@@ -4649,6 +4706,7 @@ class BasePlatformAdapter(ABC):
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
+            self._keep_typing_for_background_work(event, session_key, _thread_metadata)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
