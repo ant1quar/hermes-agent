@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import json
 import threading
@@ -68,6 +69,12 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
         _recent_subagents[sid] = {k: record.get(k) for k in ("goal", "delegation_id", "owner_agent_session_id")}
         while len(_recent_subagents) > _RECENT_SUBAGENTS_CAP:
             _recent_subagents.pop(next(iter(_recent_subagents)), None)
+        agent = record.get("agent")
+        if agent is not None:
+            with contextlib.suppress(Exception):
+                from tools.delegation_threads import record_idle_from_child
+
+                record_idle_from_child(record, agent)
 
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     """Atomically close steer acceptance and drain its final durable artifact. ``steer_subagent`` holds the same
@@ -195,7 +202,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "continue"})
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
     """Tip of a session id's compression lineage via the parent's live SessionDB (best-effort; input unchanged when
@@ -261,11 +268,28 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
         )
     return payload
 
-def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
-    registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+def _handle_control_action(
+    action: str,
+    subagent_id: Optional[str],
+    message: Optional[str],
+    parent_agent: Any,
+    *,
+    child_session_id: Optional[str] = None,
+) -> str:
+    """Synchronous control plane for delegate_task: list/steer/stop/continue. Runs in-turn (never backgrounded) over
+    the same registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
     if action == "list":
         return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+
+    if action == "continue":
+        from tools.delegate_tool_continue import run_continue_delegation
+
+        return run_continue_delegation(
+            parent_agent,
+            message=message,
+            subagent_id=(subagent_id or "").strip() or None,
+            child_session_id=(child_session_id or "").strip() or None,
+        )
 
     # steer / stop need a resolvable, owned target.
     sid = (subagent_id or "").strip()
@@ -283,7 +307,7 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
         return tool_error("action='steer' requires a non-empty 'message' describing the course correction.")
     outcome = _CONTROL_OUTCOMES.get(action)
     if outcome is None:
-        return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+        return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, stop, or continue.")
     status, note, failure = outcome
     ok = interrupt_subagent(sid) if action == "stop" else steer_subagent(sid, message.strip())
     if ok:

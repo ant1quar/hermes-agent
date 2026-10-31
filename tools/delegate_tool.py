@@ -121,7 +121,7 @@ def check_delegate_requirements() -> bool:
     return True
 
 
-def _open_child_session_db(parent_agent) -> Any:
+def _open_child_session_db(parent_agent, *, reuse_existing: bool = False) -> Any:
     """DEDICATED SessionDB handle for the child, or None: the parent's handle can be closed by its own lifecycle while
     a background child still flushes (transcript silently dropped). It MUST open the same db FILE as the parent's
     handle (non-launch profiles), else lineage / session_search break; released by the child's close() via
@@ -137,6 +137,14 @@ def _open_child_session_db(parent_agent) -> Any:
     # .db_path via __getattr__, so this works through them.
     from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError, is_worker_process
     parent_session_db = getattr(parent_agent, "_session_db", None)
+    if reuse_existing and not is_worker_process() and not isinstance(parent_session_db, RuntimeSessionStore):
+        if parent_session_db is None:
+            return None
+        with _quiet("subagent: failed to open dedicated SessionDB; child persistence disabled", exc_info=True):
+            from hermes_state_registry import acquire
+            _parent_db_path = getattr(parent_session_db, "db_path", None)
+            return acquire(_parent_db_path) if _parent_db_path is not None else acquire()
+        return None
     if is_worker_process() or isinstance(parent_session_db, RuntimeSessionStore):
         # Missing db_path on a scoped store is NOT permission to open the launch profile: the
         # owner reserves the child's row and execution under the parent's own (#141793).
@@ -230,6 +238,9 @@ def _build_child_agent(
     override_reasoning_effort: Any = None,
     profile_home: Optional[Path] = None,
     override_service_tier: Optional[str] = None,  # a route's checked speed tier (tools/delegate_tool_tuning.py)
+    existing_child_session_id: Optional[str] = None,
+    fixed_subagent_id: Optional[str] = None,
+    continue_disabled_toolsets: Optional[list[str]] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
@@ -246,15 +257,19 @@ def _build_child_agent(
 
     # One subagent_id shared by the progress callback, spawn_requested event and
     # the live registry; parent_id is set when THIS parent is itself a subagent.
-    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    if fixed_subagent_id:
+        subagent_id = fixed_subagent_id
+    else:
+        subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+    is_continue = bool(existing_child_session_id)
 
     # General delegation behavior (reasoning, compression, capabilities) stays
     # global. Only fallback policy follows the owner of a per-call route such
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
-    child_prompt = _build_child_system_prompt(
+    child_prompt = None if is_continue else _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
@@ -287,7 +302,11 @@ def _build_child_agent(
         else:
             request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
         parent_sid = getattr(parent_agent, "session_id", None)
-        child_session_db = _open_child_session_db(parent_agent)
+        child_session_db = _open_child_session_db(parent_agent, reuse_existing=is_continue)
+        if is_continue and continue_disabled_toolsets:
+            child_disabled_toolsets = list(
+                dict.fromkeys(list(child_disabled_toolsets or []) + list(continue_disabled_toolsets))
+            )
         with delegated_child_context():
             try:
                 child = AIAgent(
@@ -301,7 +320,7 @@ def _build_child_agent(
                         if child_progress_cb else None
                     ),
                     session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
-                    session_id=getattr(child_session_db, "reserved_session_id", None),
+                    session_id=existing_child_session_id or getattr(child_session_db, "reserved_session_id", None),
                     tool_progress_callback=child_progress_cb,
                     iteration_budget=None,  # fresh budget per subagent
                     # A profile route carries that profile's identity (its SOUL.md under the bound home).
@@ -348,15 +367,16 @@ def _build_child_agent(
     _attach_child(parent_agent, child)  # interrupt propagation
     # spawn_requested now — the child may queue for seconds when the pool is
     # saturated — then the subagent_start lifecycle hook.
-    _safe_progress(child_progress_cb, "subagent.spawn_requested", preview=goal)
-    with _quiet("subagent_start hook invocation failed", exc_info=True):
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "subagent_start", parent_session_id=parent_sid,
-            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "", parent_subagent_id=parent_subagent_id,
-            child_session_id=getattr(child, "session_id", None), child_subagent_id=subagent_id,
-            child_role=effective_role, child_goal=goal,
-        )
+    if not is_continue:
+        _safe_progress(child_progress_cb, "subagent.spawn_requested", preview=goal)
+        with _quiet("subagent_start hook invocation failed", exc_info=True):
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "subagent_start", parent_session_id=parent_sid,
+                parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "", parent_subagent_id=parent_subagent_id,
+                child_session_id=getattr(child, "session_id", None), child_subagent_id=subagent_id,
+                child_role=effective_role, child_goal=goal,
+            )
     return child
 
 def _run_single_child(
@@ -552,8 +572,8 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    credentials_cfg: Optional[dict[str, Any]] = None,
+    subagent_id: Optional[str] = None, child_session_id: Optional[str] = None, message: Optional[str] = None,
+    parent_agent=None, credentials_cfg: Optional[dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -564,9 +584,11 @@ def delegate_task(
 
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
-        return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
+        return _handle_control_action(
+            normalized_action, subagent_id, message, parent_agent, child_session_id=child_session_id,
+        )
     if normalized_action and normalized_action != "spawn":
-        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, stop, or continue.")
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
@@ -839,14 +861,22 @@ DELEGATE_TASK_SCHEMA = {
                 "course-correction text into one child (subagent_id + "
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
+                "'continue' = another user turn on the same child session "
+                "(subagent_id or child_session_id + message) after the worker went idle. "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop"],
+                enum=["spawn", "list", "steer", "stop", "continue"],
             ),
-            "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
+            "subagent_id": _p(
+                "string",
+                "Target for action='steer'/'stop'/'continue' (ids from spawn response, action='list', or orchestrator state).",
+            ),
+            "child_session_id": _p(
+                "string",
+                "Alternative target for action='continue' when subagent_id is unknown.",
+            ),
             "message": _p(
                 "string",
-                "For action='steer': the course correction, appended to "
-                "the child's next tool result mid-run. Be directive and specific.",
+                "For action='steer': course correction mid-run. For action='continue': the follow-up user message.",
             ),
         },
         "required": [],
@@ -882,7 +912,8 @@ registry.register(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
-        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"),
+        child_session_id=args.get("child_session_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
