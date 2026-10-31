@@ -257,10 +257,11 @@ def _alias_credential(authority, result):
     ``api_key: "${VAR}"`` is the pointer ``VAR``; ``(None, None, None)`` when it declares none."""
     from pathlib import Path
     from gateway.run import _load_gateway_config
-    from hermes_cli.config import _env_ref_var_name, read_user_config_raw
+    from hermes_cli.config import _env_ref_var_name
+    from hermes_cli.config_base_layer import read_layered_config_raw
     name = result.resolved_via_alias if result.success else ''
     path = Path(authority.db.db_path).resolve().parent / 'config.yaml'
-    raw = read_user_config_raw(path) if name else {}
+    raw = read_layered_config_raw(path) if name else {}
     for section in (('model_aliases',), ('model', 'aliases')):
         model = raw.get('model')  # `model: name` (a scalar) is valid config and declares no aliases
         entries = raw.get(section[0]) if len(section) == 1 else (model.get('aliases') if isinstance(model, dict) else None)

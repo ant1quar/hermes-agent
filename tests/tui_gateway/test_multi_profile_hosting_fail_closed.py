@@ -35,6 +35,9 @@ B_CODEX_URL = "https://secondary.example.invalid/codex"
 @pytest.fixture
 def two_homes(tmp_path, monkeypatch):
     """Launch home (root) + secondary ``profiles/b``; B's config references both tokens."""
+    # These tests pin scope isolation itself; inheritance from the root .env is the opt-in
+    # global base layer, covered in tests/hermes_cli/test_config_base_layer.py.
+    monkeypatch.setenv("HERMES_DISABLE_BASE_LAYER", "1")
     root = tmp_path / "hermes_home"
     b = root / "profiles" / "b"
     b.mkdir(parents=True)

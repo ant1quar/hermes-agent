@@ -505,8 +505,8 @@ def _profile_workspace_cwd(home):
     from hermes_constants import profile_name_for_home
     if profile_name_for_home(home) in {None, 'default'}:
         return None
-    from hermes_cli.config import read_user_config_raw
-    terminal = read_user_config_raw(Path(home) / 'config.yaml').get('terminal')
+    from hermes_cli.config_base_layer import read_layered_config_raw
+    terminal = read_layered_config_raw(Path(home) / 'config.yaml').get('terminal')
     raw = str((terminal if isinstance(terminal, dict) else {}).get('cwd') or '').strip()
     configured = os.path.abspath(os.path.expanduser(raw)) if raw not in {'', '.', 'auto', 'cwd'} else None
     return configured if configured and os.path.isdir(configured) else None

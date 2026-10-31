@@ -206,6 +206,12 @@ def collect_directory_manifests() -> list[PluginManifest]:
     logger.debug("Scanning bundled plugins: %s", repo_plugins)
     _scan("bundled (top-level)", repo_plugins, "bundled",
           {"memory", "context_engine", "model-providers", "cron_providers", "computer_use"})
+    from hermes_cli.config_base_layer import base_plugins_dir
+    global_dir = base_plugins_dir()
+    if global_dir is not None:
+        # Global plugins of a named profile; the profile's own same-named copy (scanned next) wins.
+        logger.debug("Scanning global user plugins: %s", global_dir)
+        _scan("user (global)", global_dir, "user")
     user_dir = get_hermes_home() / "plugins"
     logger.debug("Scanning user plugins: %s", user_dir)
     _scan("user", user_dir, "user")

@@ -561,6 +561,16 @@ def load_hermes_dotenv(
         loaded.append(user_env)
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 
+    # Global base .env of a named profile fills only what the profile's own .env does not define.
+    from hermes_cli.config_base_layer import base_env_path, load_base_env
+    base_values = load_base_env(home_path)
+    if base_values:
+        defined = _env_keys_defined_in_dotenv(user_env) if user_env.exists() else set()
+        for _name, _value in base_values.items():
+            if _name not in defined:
+                os.environ[_name] = _value
+        loaded.append(base_env_path(home_path))
+
     # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
     # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
     # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
