@@ -1499,6 +1499,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         if len(deliverable) == 1:
             evt, synth_text = deliverable[0]
             return await self._deliver_completion_notification(synth_text, evt)
+        from tools.delegate_tool_config import _get_independent_completions
+        if _get_independent_completions():
+            # Independent completions promise one user-facing message per unit: never coalesce them.
+            outcomes = [await self._deliver_completion_notification(text, evt) for evt, text in deliverable]
+            return False if False in outcomes else (True if True in outcomes or acknowledged else None)
         # Check the entire group before claiming ANY row: an unavailable sibling must
         # not exhaust its budget just because the primary has a usable route.
         for evt, _text in deliverable:
