@@ -873,9 +873,12 @@ def _discover_all_plugins() -> list:
     seen: dict = {}
     # memory/, context_engine/, computer_use/ and model-providers/ load through dedicated registries, not the
     # PluginManager opt-in surface, so listing them as toggleable plugins would mislead.
+    from hermes_cli.config_base_layer import base_plugins_dir
     from hermes_cli.plugins import discover_entrypoint_manifests, get_bundled_plugins_dir
+    global_dir = base_plugins_dir()
     for base, source, skip in (
         (get_bundled_plugins_dir(), "bundled", {"memory", "context_engine", "computer_use", "model-providers"}),
+        *(((global_dir, "user", set()),) if global_dir is not None else ()),
         (_plugins_dir(), "user", set()),
     ):
         _scan_level(base, source, skip, "", 0, seen)

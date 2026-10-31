@@ -102,11 +102,14 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
                     from hermes_cli.config_backups import backup_config
                     backup_config(config_path, "good")
 
-        env_snapshot = _config._env_ref_snapshot(raw)
+        from hermes_cli.config_base_layer import load_base_config
+        base = load_base_config(config_path.parent)
+        layered = _config._deep_merge(base, raw) if base else raw
+        env_snapshot = _config._env_ref_snapshot(layered)
         managed = managed_scope.load_managed_config()
         if managed:
             _config._env_ref_snapshot(managed, env_snapshot)
-        effective = _effective(raw)
+        effective = _effective(layered)
         # A recovered result is never cached under the corrupt file's signature: a later
         # ``fail_closed`` caller must still see the parse error, not a cache hit.
         if cache_sig is not None and not recovered:

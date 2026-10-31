@@ -400,7 +400,10 @@ def build_profile_secret_scope(hermes_home: Path) -> dict[str, str]:
     """Build a profile's secret mapping from ``<home>/.env`` plus its external
     secret sources. Global vars are NOT copied in — ``get_secret`` reads those
     from ``os.environ`` — so the scope holds only profile secrets."""
-    secrets = load_env_file(Path(hermes_home) / ".env")
+    # Global base .env (named profiles only) UNDER the profile's own file; allowlist keys never inherit.
+    from hermes_cli.config_base_layer import load_base_env
+    secrets = {k: v for k, v in load_base_env(Path(hermes_home)).items() if not _is_global_env(k)}
+    secrets.update(load_env_file(Path(hermes_home) / ".env"))
     try:
         from hermes_cli.env_loader import get_secret_source_values
         external_secrets = get_secret_source_values(Path(hermes_home))

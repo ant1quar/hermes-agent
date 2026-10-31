@@ -180,6 +180,11 @@ def _check_env_file(should_fix: bool, f: Finding) -> None:
             content = env_path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
             content = env_path.read_text(encoding="latin-1")
+        from hermes_cli.config_base_layer import base_env_path
+        base_env = base_env_path(HERMES_HOME)
+        if base_env is not None and base_env.is_file():
+            # Inherited keys count too; channel/allowlist keys never reach the provider check.
+            content = base_env.read_text(encoding="utf-8-sig", errors="replace") + "\n" + content
         if not check_bool(_has_provider_env_config(content), "API key or custom endpoint configured", f"No API key found in {_DHH}/.env"):
             f.issues.append("Run 'hermes setup' to configure API keys")
     elif (PROJECT_ROOT / '.env').exists():  # project root as fallback

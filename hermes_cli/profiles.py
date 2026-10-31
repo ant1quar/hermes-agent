@@ -761,9 +761,9 @@ def _read_config_model(profile_dir: Path) -> tuple:
 
     def _read() -> tuple:
         try:
-            # load_config() targets the ACTIVE profile's home; read THIS profile's file raw.
-            from hermes_cli.config import read_user_config_raw
-            model_cfg = read_user_config_raw(config_path).get("model", {})
+            # load_config() targets the ACTIVE profile's home; read THIS profile's file (+ its base layer).
+            from hermes_cli.config_base_layer import read_layered_config_raw
+            model_cfg = read_layered_config_raw(config_path).get("model", {})
             if isinstance(model_cfg, str):
                 return model_cfg, None
             if isinstance(model_cfg, dict):

@@ -2233,6 +2233,11 @@ def _load_config_cache_sig(config_path: Path) -> tuple[Optional[tuple[int, int, 
         managed_sig = file_signature(mst) if mst else (0, 0, 0, 0)
     except OSError:
         managed_sig = (0, 0, 0, 0)
+    from hermes_cli.config_base_layer import base_config_signature
+    base_sig = base_config_signature(config_path.parent)
+    if base_sig != (0, 0, 0, 0):
+        # Folded into the managed slot so the cache tuple keeps its fixed 8-int prefix.
+        managed_sig = tuple(hash((managed_sig, base_sig, i)) for i in range(4))
     if user_sig is None and managed_sig == (0, 0, 0, 0):
         return None, None
     return user_sig, (*(user_sig or (0, 0, 0, 0)), *managed_sig)
@@ -2258,7 +2263,8 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
         from hermes_cli.moa_config import apply_user_moa_presets
         raw_good = load_newest_good_backup(config_path)
         if raw_good is not None:
-            merged_good = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw_good)
+            from hermes_cli.config_base_layer import load_base_config
+            merged_good = _deep_merge(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), load_base_config()), raw_good)
             apply_user_moa_presets(merged_good, raw_good)
             normalized = _canonicalize_config(merged_good)
             expanded_good: dict[str, Any] = _expand_env_vars(normalized)  # type: ignore[assignment]
@@ -2355,7 +2361,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
-        config = copy.deepcopy(DEFAULT_CONFIG)
+        from hermes_cli.config_base_layer import load_base_config
+        base_config = load_base_config()
+        config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), base_config)
+        if base_config:
+            from hermes_cli.moa_config import apply_user_moa_presets
+            apply_user_moa_presets(config, base_config)
 
         if user_sig is not None:
             try:
@@ -2510,7 +2521,15 @@ def save_config(
         if strip_defaults:
             # ``_strip_default_values`` always preserves ``_config_version`` itself.
             effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
-            normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
+            # A named profile strips against defaults + the global base so a save never copies
+            # inherited values into the profile file (they would then shadow later global edits).
+            from hermes_cli.config_base_layer import load_base_config
+            base_config = load_base_config()
+            strip_against = (
+                _canonicalize_config(_deep_merge(copy.deepcopy(DEFAULT_CONFIG), base_config))
+                if base_config else DEFAULT_CONFIG
+            )
+            normalized = _strip_default_values(normalized, strip_against, preserve_keys=effective_preserve_keys)
 
         atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
         _secure_file(config_path)
@@ -2529,8 +2548,12 @@ def load_env() -> dict[str, str]:
     if _worker_config_snapshot() is not None:
         return {}
     from agent.secret_scope import load_env_file  # the one .env tokenizer; also installs profile scopes
+    from hermes_cli.config_base_layer import load_base_env
 
-    return load_env_file(get_env_path())
+    env_path = get_env_path()
+    values = load_base_env(env_path.parent)
+    values.update(load_env_file(env_path))
+    return values
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -3690,6 +3713,11 @@ def _cmd_config_set(args):
     value = getattr(args, 'value', None)
     if not key or value is None:
         _usage_exit(*_USAGE_SET)
+    if getattr(args, 'global_scope', False):
+        from hermes_cli.config_global_cmd import run_global
+        run_global(lambda k, *a: _run_write_command(set_config_value, k, *a),
+                   key, value, bool(getattr(args, 'force', False)))
+        return
     _run_write_command(set_config_value, key, value, bool(getattr(args, 'force', False)))
 
 
@@ -3697,6 +3725,10 @@ def _cmd_config_unset(args):
     key = getattr(args, 'key', None)
     if not key:
         _usage_exit(*_USAGE_UNSET)
+    if getattr(args, 'global_scope', False):
+        from hermes_cli.config_global_cmd import run_global
+        run_global(lambda k: _run_write_command(unset_config_value, k), key)
+        return
     _run_write_command(unset_config_value, key)
 
 
@@ -3712,6 +3744,11 @@ def _print_banner(text: str) -> None:
 
 
 def _cmd_config_migrate(args):
+    if getattr(args, 'global_scope', False):
+        from hermes_cli.config_global_cmd import global_home
+        args.global_scope = False
+        with global_home():
+            return _cmd_config_migrate(args)
     _print_banner("🔄 Checking configuration for updates...")
 
     missing_env = get_missing_env_vars(required_only=False)
@@ -3789,14 +3826,18 @@ def _cmd_config_check(args):
     print()
 
 
-def _cmd_config_show() -> None:
+def _cmd_config_show(args=None) -> None:
+    if getattr(args, 'origin', False):
+        from hermes_cli.config_global_cmd import show_config_origins
+        show_config_origins()
+        return
     from hermes_cli.config_show import show_config
     show_config()
 
 
 _CONFIG_SUBCOMMANDS = {
     None: lambda args: _cmd_config_show(),
-    "show": lambda args: _cmd_config_show(),
+    "show": _cmd_config_show,
     "edit": lambda args: edit_config(),
     "get": _cmd_config_get,
     "set": _cmd_config_set,

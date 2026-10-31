@@ -359,7 +359,22 @@ def _plugin_dir_stamps(home: Path) -> tuple:
             return os.stat(path).st_mtime_ns
         except OSError:
             return None
-    return (stamp(home / "plugins"), stamp(home / "plugins" / "model-providers"))
+    stamps = (stamp(home / "plugins"), stamp(home / "plugins" / "model-providers"))
+    base = _base_plugins_dir(home)
+    if base is not None:
+        stamps += (stamp(base), stamp(base / "model-providers"))
+    return stamps
+
+
+def _base_plugins_dir(home: Path | None = None) -> Path | None:
+    """The global ``plugins/`` a named profile inherits from the default home, or None."""
+    try:
+        from hermes_cli.config_base_layer import base_plugins_dir
+
+        d = base_plugins_dir(home)
+        return d if d is not None and d.is_dir() else None
+    except Exception:
+        return None
 
 
 def _user_plugins_dir() -> Path | None:
@@ -429,28 +444,36 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
 
     ``$HERMES_HOME/plugins/model-providers/<name>/`` first, then plugins cloned flat by
     ``hermes plugins install`` into ``$HERMES_HOME/plugins/<name>/`` that declare
-    ``kind: model-provider`` (PluginManager owns every other kind there). Per-home module names
-    let two profiles carry the same plugin without aliasing each other's registrations.
+    ``kind: model-provider`` (PluginManager owns every other kind there). A named profile also
+    gets the default home's global ``plugins/`` (base layer) underneath its own. Per-home module
+    names let two profiles carry the same plugin without aliasing each other's registrations.
     """
     global _discovering
     token, prior_discovering = _REGISTRATION_TARGET.set(layer), _discovering
     _discovering = True
     try:
-        user_dir = _user_plugins_dir()
-        if user_dir is not None:
-            for child in sorted(user_dir.iterdir()):
-                if child.is_dir() and not child.name.startswith(("_", ".")):
-                    _import_plugin_dir(child, "user", home_key=key)
-        installed_dir = _installed_plugins_dir()
-        if installed_dir is not None:
-            for child in sorted(installed_dir.iterdir()):
-                if not child.is_dir() or child.name.startswith(("_", ".")) or child.name == "model-providers":
-                    continue
-                if _declares_model_provider_kind(child):
-                    _import_plugin_dir(child, "user", home_key=key)
+        # Global (base-layer) plugins first: registration is last-writer-wins, so the
+        # profile's own same-named copy overrides them.
+        base_dir = _base_plugins_dir()
+        if base_dir is not None:
+            _scan_plugin_root(base_dir / "model-providers", base_dir, f"{key}\0global")
+        _scan_plugin_root(_user_plugins_dir(), _installed_plugins_dir(), key)
     finally:
         _REGISTRATION_TARGET.reset(token)
         _discovering = prior_discovering
+
+
+def _scan_plugin_root(provider_dir: Path | None, installed_dir: Path | None, module_key: str) -> None:
+    if provider_dir is not None and provider_dir.is_dir():
+        for child in sorted(provider_dir.iterdir()):
+            if child.is_dir() and not child.name.startswith(("_", ".")):
+                _import_plugin_dir(child, "user", home_key=module_key)
+    if installed_dir is not None and installed_dir.is_dir():
+        for child in sorted(installed_dir.iterdir()):
+            if not child.is_dir() or child.name.startswith(("_", ".")) or child.name == "model-providers":
+                continue
+            if _declares_model_provider_kind(child):
+                _import_plugin_dir(child, "user", home_key=module_key)
 
 
 def _user_module_name(plugin_dir: Path, home_key: str) -> str:
