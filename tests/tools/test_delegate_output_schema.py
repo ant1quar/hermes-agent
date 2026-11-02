@@ -24,6 +24,7 @@ from tools.delegate_tool import (
 from tools.delegation_output_schema import (
     append_output_contract,
     build_retry_message,
+    extract_json_candidate,
     validate_output,
 )
 
@@ -75,6 +76,28 @@ class TestValidateOutput:
         assert ok is False
         assert errors
 
+    def test_two_streamed_attempts_validate_on_the_last_object(self):
+        """A provider retry that streamed both attempts: 'Extra data' used to reject the whole answer."""
+        text = ('Investigating X.\n\n\n{"city": "Old", "zip": "1"}'
+                'Investigating X.\n\n\n{"city": "New", "zip": "2"}')
+        ok, errors = validate_output(text, ADDRESS_SCHEMA)
+        assert ok is True and errors == []
+        assert json.loads(extract_json_candidate(text, ADDRESS_SCHEMA))["city"] == "New"
+
+    def test_prose_braces_before_object_are_skipped(self):
+        ok, _ = validate_output('Paths use {HERMES_HOME} and [1].\n{"city": "Rome"}', ADDRESS_SCHEMA)
+        assert ok is True
+
+    def test_inner_array_is_not_taken_for_the_answer(self):
+        text = 'Done.\n```json\n{"city": "Oslo", "plan": {"parts": ["a", "b"]}}\n```'
+        ok, _ = validate_output(text, ADDRESS_SCHEMA)
+        assert ok is True
+
+    def test_last_object_errors_are_reported(self):
+        ok, errors = validate_output('{"city": "A"} then {"zip": "1"}', {**ADDRESS_SCHEMA, "required": ["zip", "x"]})
+        assert ok is False
+        assert any("'x'" in e for e in errors)
+
 
 
 
@@ -90,6 +113,15 @@ class TestPromptPlumbing:
         msg = build_retry_message(["'city' is a required property"])
         assert "'city' is a required property" in msg
         assert "JSON" in msg
+
+    def test_retry_message_names_required_keys(self):
+        msg = build_retry_message(["x"], ADDRESS_SCHEMA)
+        assert "Required top-level keys: city." in msg
+
+    def test_prose_only_retry_asks_to_finish_the_work(self):
+        msg = build_retry_message(["Response is not valid JSON"], ADDRESS_SCHEMA, no_json=True)
+        assert "continue it with tool calls" in msg
+        assert "rejected by the output contract" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +288,43 @@ class TestRunSingleChildSchemaValidation:
         assert entry["schema_valid"] is True and len(child.calls) == 1
 
 
+    def test_retry_turn_continues_the_child_conversation(self):
+        """The retry turn without history saw only the rejection, could not recover the task and answered
+        with a schema-valid 'resend the task' that the parent relayed to the user."""
+        from tools.delegate_tool_child_run import _validate_child_output_schema
+
+        history = [{"role": "user", "content": "produce the address"},
+                   {"role": "assistant", "content": "Checking the registry."}]
+        seen: dict = {}
+
+        class _Child(_StubChild):
+            def run_conversation(self, user_message, task_id=None, conversation_history=None, **_kwargs):
+                seen["history"] = conversation_history
+                seen["message"] = user_message
+                return {"final_response": '{"city": "Oslo"}', "api_calls": 1,
+                        "messages": list(conversation_history or []) + [
+                            {"role": "user", "content": user_message},
+                            {"role": "assistant", "content": '{"city": "Oslo"}'}]}
+
+        child = _Child([])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        result = {"final_response": "Checking the registry.", "api_calls": 1, "messages": history}
+        outcome = _validate_child_output_schema(child, result, 0, "child-0", None)
+        assert outcome.valid is True and outcome.retries == 1 and outcome.first_errors
+        assert seen["history"] == history
+        assert "continue it with tool calls" in seen["message"]
+        assert len(result["messages"]) == 4  # history once, then the retry pair
+
+    def test_valid_glued_answer_delivers_only_the_accepted_object(self):
+        from tools.delegate_tool_child_run import _validate_child_output_schema
+
+        child = _StubChild([])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        result = {"final_response": 'A.\n{"city": "Old"}B.\n{"city": "New"}', "api_calls": 1, "messages": []}
+        outcome = _validate_child_output_schema(child, result, 0, "child-0", None)
+        assert outcome.valid is True and outcome.retries == 0 and not child.calls
+        assert json.loads(result["final_response"]) == {"city": "New"}
+
     def test_retry_turn_runs_in_delegated_child_context(self, monkeypatch):
         """The retry is a second run_conversation on the child, issued from the parent's
         thread where HERMES_KANBAN_TASK is set. Unwrapped it carries the worker's identity,
@@ -279,6 +348,54 @@ class TestRunSingleChildSchemaValidation:
         _validate_child_output_schema(child, {"final_response": "not json", "api_calls": 1}, 0, "child-0", None)
         assert seen == [True]
         assert is_delegated_child_context() is False
+
+
+class TestWakeSchemaRetryMarker:
+    def test_header_and_note_name_the_correction_turn(self):
+        import re
+        from tools.process_registry_notifications import _format_batch_delegation
+
+        goal = 'Merge duplicates.\n\nOUTPUT CONTRACT (machine-validated):\n{\n  "type": "object"\n}'
+        evt = {"goals": [goal], "results": [{
+            "task_index": 0, "status": "completed", "summary": '{"ok": false}', "api_calls": 5,
+            "duration_seconds": 86.28, "schema_valid": True, "schema_retries": 1,
+            "schema_first_errors": ["Response is not valid JSON: Extra data: line 1 column 608 (char 607)"],
+        }]}
+        text = _format_batch_delegation(evt, "deleg_0d0d0393", 0.0)
+        assert "schema_retries=1) ---" in text
+        assert "[OUTPUT CONTRACT — the subagent's first final answer was rejected (Response is not valid" in text
+        # orchestrator-fsm keys the redirect on this exact header shape (multi-line goal included)
+        assert re.search(r"\(status=[^)\n]*\bschema_retries=[1-9][^)\n]*\) ---", text)
+
+    def test_no_marker_without_retry(self):
+        from tools.process_registry_notifications import _format_batch_delegation
+
+        evt = {"goals": ["g"], "results": [{"task_index": 0, "status": "completed", "summary": "{}"}]}
+        assert "schema_retries" not in _format_batch_delegation(evt, "deleg_1", 0.0)
+
+
+class TestWakeSchemaRetryMarker:
+    def test_header_and_note_name_the_correction_turn(self):
+        import re
+        from tools.process_registry_notifications import _format_batch_delegation
+
+        goal = 'Merge duplicates.\n\nOUTPUT CONTRACT (machine-validated):\n{\n  "type": "object"\n}'
+        evt = {"goals": [goal], "results": [{
+            "task_index": 0, "status": "completed", "summary": '{"ok": false}', "api_calls": 5,
+            "duration_seconds": 86.28, "schema_valid": True, "schema_retries": 1,
+            "schema_first_errors": ["Response is not valid JSON: Extra data: line 1 column 608 (char 607)"],
+        }]}
+        text = _format_batch_delegation(evt, "deleg_0d0d0393", 0.0)
+        assert "schema_retries=1) ---" in text
+        assert "[OUTPUT CONTRACT — the subagent's first final answer was rejected (Response is not valid" in text
+        # orchestrator-fsm keys the redirect on this exact header shape (multi-line goal included)
+        assert re.search(r"\(status=[^)\n]*\bschema_retries=[1-9][^)\n]*\) ---", text)
+
+    def test_no_marker_without_retry(self):
+        from tools.process_registry_notifications import _format_batch_delegation
+
+        evt = {"goals": ["g"], "results": [{"task_index": 0, "status": "completed", "summary": "{}"}]}
+        assert "schema_retries" not in _format_batch_delegation(evt, "deleg_1", 0.0)
 
 
 # ---------------------------------------------------------------------------
