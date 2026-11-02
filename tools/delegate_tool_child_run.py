@@ -516,6 +516,7 @@ class _SchemaOutcome:
     valid: Optional[bool]
     errors: list[str]
     retries: int
+    first_errors: list[str] = field(default_factory=list)
 
 def _validate_child_output_schema(
     child: Any, result: dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
@@ -525,14 +526,20 @@ def _validate_child_output_schema(
     _output_schema = getattr(child, "_delegate_output_schema", None)
     if not isinstance(_output_schema, dict):
         return _SchemaOutcome(_output_schema, None, [], 0)
-    from tools.delegation_output_schema import build_retry_message, validate_output
+    from tools.delegation_output_schema import build_retry_message, has_json_value, validate_output
     _first_text = result.get("final_response") or ""
     _schema_valid, _schema_errors = validate_output(_first_text, _output_schema)
+    if _schema_valid:
+        _normalize_schema_answer(result, _output_schema)
     if _schema_valid or not _first_text.strip() or result.get("interrupted", False):
         return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 0)
+    _first_errors = list(_schema_errors)
 
-    # Exactly one retry turn, carrying the validation errors verbatim (no
-    # schema re-paste — the child already holds the contract in its context).
+    # Exactly one retry turn, carrying the validation errors verbatim. The schema is not re-pasted, so the
+    # turn must continue the child's own conversation: without it the child sees only this message, cannot
+    # recover the task or its result, and answers with a schema-valid "resend the task" that reaches the user.
+    _history = result.get("messages")
+    _history = list(_history) if isinstance(_history, list) and _history else None
     _retry_result = None
     try:
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
@@ -541,7 +548,11 @@ def _validate_child_output_schema(
         from tools.delegate_tool_routes import child_profile_scope
         with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
             _retry_result = child.run_conversation(
-                user_message=build_retry_message(_schema_errors), task_id=child_task_id,
+                user_message=build_retry_message(
+                    _schema_errors, _output_schema, no_json=not has_json_value(_first_text),
+                ),
+                conversation_history=_history,
+                task_id=child_task_id,
                 stream_callback=relay_child_text,
             )
     except Exception as _retry_exc:
@@ -556,9 +567,22 @@ def _validate_child_output_schema(
             pass
         _retry_messages = _retry_result.get("messages")
         if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
-            result["messages"] = result["messages"] + _retry_messages
+            # The retry turn returns its full transcript, which already starts with the history it was given.
+            continued = bool(_history) and bool(_retry_messages) and _retry_messages[0] is _history[0]
+            result["messages"] = _retry_messages if continued else result["messages"] + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
-    return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
+        if _schema_valid:
+            _normalize_schema_answer(result, _output_schema)
+    return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1, _first_errors)
+
+
+def _normalize_schema_answer(result: dict[str, Any], schema: dict[str, Any]) -> None:
+    """Several JSON values in one valid answer (a provider streamed two attempts, or a second block followed
+    the first): deliver only the one the validator accepted, so the parent never reads the stale one."""
+    from tools.delegation_output_schema import extract_json_candidate, json_values
+    text = result.get("final_response") or ""
+    if len(json_values(text)) > 1:
+        result["final_response"] = extract_json_candidate(text, schema)
 
 def _build_tool_trace(messages: Any) -> list[dict[str, Any]]:
     """Tool trace from the child's conversation messages, pairing parallel
@@ -675,6 +699,8 @@ def _build_result_entry(
         entry["schema_valid"] = bool(schema.valid)
         if schema.retries:
             entry["schema_retries"] = schema.retries
+            if schema.first_errors:
+                entry["schema_first_errors"] = schema.first_errors
         if not schema.valid and schema.errors:
             entry["schema_errors"] = schema.errors
         if schema.valid is False and usable_summary:

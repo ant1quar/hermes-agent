@@ -146,6 +146,15 @@ _TRUNCATED_SUMMARY_NOTE = (
     "the unfinished part.]")
 
 
+def _schema_retry_note(r: dict) -> str:
+    first = "; ".join(str(e) for e in (r.get("schema_first_errors") or [])[:3])
+    return ("[OUTPUT CONTRACT — the subagent's first final answer was rejected"
+            + (f" ({first})" if first else "")
+            + " and the text below is its answer to one correction turn. If it talks about the contract, JSON "
+            "or asks for the task again instead of reporting the work, it is protocol noise: do not relay it to "
+            "the user — continue the same subagent with the original goal.]")
+
+
 def _is_truncated(entry: dict) -> bool:
     return bool(entry.get("truncated") or entry.get("exit_reason") == "max_iterations")
 
@@ -240,11 +249,15 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         header = (f"--- {icon} TASK {idx + 1}/{n}" + (f": {r_goal}" if r_goal else "") + f"  (status={r_status}"
                   + (f", api_calls={r['api_calls']}" if r.get("api_calls") else "")
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
+                  + (f", schema_retries={r['schema_retries']}" if r.get("schema_retries") else "")
+                  + (", schema_valid=false" if r.get("schema_valid") is False else "")
                   + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else ""))
         lines += ["", header + ") ---"]
         if r_status in _DONE and r_summary:
             if r_truncated:
                 lines.append(_TRUNCATED_SUMMARY_NOTE)
+            if r.get("schema_retries"):
+                lines.append(_schema_retry_note(r))
             lines.append(r_summary)
         elif r_summary:
             if r_error:
